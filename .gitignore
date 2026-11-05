@@ -1,0 +1,10 @@
+*.pt
+*.onnx
+*.log
+logs/
+outputs/
+wandb/
+*.mp4
+*.mov
+*.webm
+__pycache__/

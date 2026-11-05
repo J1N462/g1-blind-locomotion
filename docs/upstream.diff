@@ -1,0 +1,245 @@
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
+@@ -168,10 +168,10 @@
+         heading_command=False,
+         debug_vis=True,
+         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
+-            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.1, 0.1)
++            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.3, 0.3)  # matches 2026-07-25 baseline env.yaml exactly
+         ),
+         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
+-            lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.2, 0.2)
++            lin_vel_x=(-0.3, 1.2), lin_vel_y=(-0.6, 0.6), ang_vel_z=(-1.0, 1.0)  # matches 2026-07-25 baseline env.yaml exactly
+         ),
+     )
+ 
+@@ -275,7 +275,7 @@
+     )
+     joint_deviation_waists = RewTerm(
+         func=mdp.joint_deviation_l1,
+-        weight=-1,
++        weight=-0.1,  # matches confirmed 7/25 baseline value
+         params={
+             "asset_cfg": SceneEntityCfg(
+                 "robot",
+@@ -350,8 +350,9 @@
+ class CurriculumCfg:
+     """Curriculum terms for the MDP."""
+ 
+-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
++    #terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+     lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
++    ang_vel_cmd_levels = CurrTerm(mdp.ang_vel_cmd_levels)
+ 
+ 
+ @configclass
+@@ -404,3 +405,181 @@
+         self.scene.terrain.terrain_generator.num_rows = 2
+         self.scene.terrain.terrain_generator.num_cols = 10
+         self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
++# ============================================================================
++# [v2] Resume from a flat-terrain base policy -> blind rough terrain + delay robustness
++#
++# Changes from v1:
++#   1) Added a survival condition to the terrain curriculum: falling demotes instead of promoting
++#      (v1 only looked at distance walked, so walking far and then falling still promoted -> stalled at levels where it falls)
++#   2) Start with weaker DR: action delay 0~10 ms (v1: 0~20), PD gains ±10% (v1: ±20%)
++#   3) PPO stabilization (entropy, KL) is set via train.py command-line overrides, not in code
++#
++# Observation/action dimensions are identical to the flat base policy -> can --resume from its checkpoint.
++# ============================================================================
++
++import torch
++
++import isaaclab.envs.mdp as isaac_mdp
++from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
++from isaaclab.envs.mdp.actions.joint_actions import JointPositionAction
++
++# (terrain_gen, configclass, EventTerm, CurrTerm, SceneEntityCfg, mdp,
++#  CurriculumCfg, EventCfg, RobotEnvCfg are already imported/defined above in the original file)
++
++
++# ---------------------------------------------------------------------------
++# 1. Terrain (same as v1)
++# ---------------------------------------------------------------------------
++BLIND_ROUGH_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
++    size=(8.0, 8.0),
++    border_width=20.0,
++    num_rows=10,
++    num_cols=20,
++    horizontal_scale=0.1,
++    vertical_scale=0.005,
++    slope_threshold=0.75,
++    difficulty_range=(0.0, 1.0),
++    use_cache=False,
++    sub_terrains={
++        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.2),
++        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
++            proportion=0.3, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
++        ),
++        "slope_up": terrain_gen.HfPyramidSlopedTerrainCfg(
++            proportion=0.15, slope_range=(0.0, 0.3), platform_width=2.0, border_width=0.25
++        ),
++        "slope_down": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
++            proportion=0.15, slope_range=(0.0, 0.3), platform_width=2.0, border_width=0.25
++        ),
++        "stairs_up": terrain_gen.MeshPyramidStairsTerrainCfg(
++            proportion=0.1, step_height_range=(0.0, 0.08), step_width=0.3,
++            platform_width=3.0, border_width=1.0, holes=False,
++        ),
++        "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
++            proportion=0.1, step_height_range=(0.0, 0.08), step_width=0.3,
++            platform_width=3.0, border_width=1.0, holes=False,
++        ),
++    },
++)
++
++
++# ---------------------------------------------------------------------------
++# 2. Terrain curriculum with a survival condition (based on Isaac Lab terrain_levels_vel)
++#    Promote: walked more than half the terrain AND did not fall (episode ended by time_out)
++#    Demote: walked less than half the commanded distance OR fell
++# ---------------------------------------------------------------------------
++def terrain_levels_survival(env, env_ids, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
++    asset = env.scene[asset_cfg.name]
++    terrain = env.scene.terrain
++    command = env.command_manager.get_command("base_velocity")
++    distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
++    fell = env.termination_manager.terminated[env_ids]  # terminations other than time_out (falls, etc.)
++    move_up = (distance > terrain.cfg.terrain_generator.size[0] / 2) & ~fell
++    move_down = (distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5) | fell
++    move_down &= ~move_up
++    terrain.update_env_origins(env_ids, move_up, move_down)
++    return torch.mean(terrain.terrain_levels.float())
++
++
++# ---------------------------------------------------------------------------
++# 3. Action delay (same implementation as v1, narrower range)
++# ---------------------------------------------------------------------------
++class DelayedJointPositionAction(JointPositionAction):
++    def __init__(self, cfg, env):
++        super().__init__(cfg, env)
++        self._max_delay = int(cfg.max_delay_steps)
++        self._min_delay = int(cfg.min_delay_steps)
++        n = self.num_envs
++        self._buf = torch.zeros(self._max_delay + 1, n, self.action_dim, device=self.device)
++        self._delay = torch.randint(self._min_delay, self._max_delay + 1, (n,), device=self.device)
++        self._env_idx = torch.arange(n, device=self.device)
++        self._fresh = torch.ones(n, dtype=torch.bool, device=self.device)
++
++    def apply_actions(self):
++        target = self.processed_actions
++        if self._fresh.any():
++            self._buf[:, self._fresh] = target[self._fresh].unsqueeze(0)
++            self._fresh[:] = False
++        self._buf = torch.roll(self._buf, shifts=1, dims=0)
++        self._buf[0] = target
++        delayed = self._buf[self._delay, self._env_idx]
++        self._asset.set_joint_position_target(delayed, joint_ids=self._joint_ids)
++
++    def reset(self, env_ids=None):
++        super().reset(env_ids)
++        if env_ids is None:
++            env_ids = self._env_idx
++        elif not isinstance(env_ids, torch.Tensor):
++            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
++        self._fresh[env_ids] = True
++        self._delay[env_ids] = torch.randint(
++            self._min_delay, self._max_delay + 1, (len(env_ids),), device=self.device
++        )
++
++
++@configclass
++class DelayedJointPositionActionCfg(JointPositionActionCfg):
++    class_type: type = DelayedJointPositionAction
++    min_delay_steps: int = 0
++    max_delay_steps: int = 2  # sim.dt=0.005 → 0~10 ms (v1: 4 = 0~20 ms)
++
++
++# ---------------------------------------------------------------------------
++# 4. Curriculum / events
++# ---------------------------------------------------------------------------
++@configclass
++class RoughCurriculumCfg(CurriculumCfg):
++    terrain_levels = CurrTerm(func=terrain_levels_survival)
++
++
++@configclass
++class RoughEventCfg(EventCfg):
++    actuator_gains = EventTerm(
++        func=isaac_mdp.randomize_actuator_gains,
++        mode="reset",
++        params={
++            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
++            "stiffness_distribution_params": (0.9, 1.1),  # v1: (0.8, 1.2)
++            "damping_distribution_params": (0.9, 1.1),
++            "operation": "scale",
++            "distribution": "uniform",
++        },
++    )
++
++
++# ---------------------------------------------------------------------------
++# 5. Environment
++# ---------------------------------------------------------------------------
++@configclass
++class RobotRoughEnvCfg(RobotEnvCfg):
++    curriculum: RoughCurriculumCfg = RoughCurriculumCfg()
++    events: RoughEventCfg = RoughEventCfg()
++
++    def __post_init__(self):
++        self.scene.terrain.terrain_type = "generator"
++        self.scene.terrain.terrain_generator = BLIND_ROUGH_TERRAINS_CFG
++        self.scene.terrain.max_init_terrain_level = 2
++        super().__post_init__()
++
++        old = self.actions.JointPositionAction
++        fields = {k: getattr(old, k) for k in old.__dataclass_fields__ if k != "class_type"}
++        self.actions.JointPositionAction = DelayedJointPositionActionCfg(
++            **fields, min_delay_steps=0, max_delay_steps=2
++        )
++
++        r = self.commands.base_velocity.ranges
++        r.lin_vel_x = (-0.3, 0.6)
++        r.lin_vel_y = (-0.3, 0.3)
++        r.ang_vel_z = (-0.5, 0.5)
++
++
++@configclass
++class RobotRoughPlayEnvCfg(RobotRoughEnvCfg):
++    def __post_init__(self):
++        super().__post_init__()
++        self.scene.num_envs = 32
++        self.scene.terrain.terrain_generator.num_rows = 5
++        self.scene.terrain.terrain_generator.num_cols = 10
++        self.scene.terrain.max_init_terrain_level = None
++        self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
++        self.observations.policy.enable_corruption = False
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py
+@@ -10,3 +10,14 @@
+         "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
+     },
+ )
++
++gym.register(
++    id="Unitree-G1-29dof-Velocity-Rough",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg:RobotRoughEnvCfg",
++        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg:RobotRoughPlayEnvCfg",
++        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
++    },
++)
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/curriculums.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/curriculums.py
+@@ -50,7 +50,7 @@
+     reward = torch.mean(env.reward_manager._episode_sums[reward_term_name][env_ids]) / env.max_episode_length_s
+ 
+     if env.common_step_counter % env.max_episode_length == 0:
+-        if reward > reward_term.weight * 0.8:
++        if reward > reward_term.weight * 0.5:  # ang_vel only -- lin_vel_cmd_levels (line 24) left at 0.8
+             delta_command = torch.tensor([-0.1, 0.1], device=env.device)
+             ranges.ang_vel_z = torch.clamp(
+                 torch.tensor(ranges.ang_vel_z, device=env.device) + delta_command,
