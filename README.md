@@ -5,7 +5,7 @@ Blind (proprioception-only) rough-terrain walking policy for the Unitree G1 (29-
 This repository contains **only the files I changed or added**, at the same paths as in unitree_rl_lab. It is not a standalone project: copy these files over an upstream checkout to use them.
 
 ## Demo
-- Real robot: [TBD]
+- Real robot video: [TBD]
 
 ## What I changed (v2)
 Starting from a flat-terrain velocity policy, training was resumed on rough terrain with:
@@ -50,7 +50,7 @@ Smaller changes to the base config, carried over from my earlier flat-terrain se
 Note: my local run used rsl-rl 5.0.1, which needed a small runner-config compatibility change in `train.py`. That change is not included here; upstream `train.py` is used as is.
 
 ## Training results (from the training log)
-At iteration 13192 of the v2 run:
+The deployed policy is checkpoint `model_13100` of the v2 run. At iteration 13192 of the v2 run:
 
 | Logged metric | Value |
 |---|---|
@@ -60,7 +60,24 @@ At iteration 13192 of the v2 run:
 | `Episode_Reward/track_lin_vel_xy` | 0.8618 |
 | `Episode_Reward/track_ang_vel_z` | 0.4018 |
 
-Real-robot results: [TBD]
+Yaw-rate tracking error (`Metrics/base_velocity/error_vel_yaw`, last logged value of each run):
+
+| Flat base policy | v2 |
+|---|---|
+| 0.96 | 0.41 |
+
+Each value is a training-time metric under that run's own terrain and command curriculum (v2: rough terrain, wider yaw command range), not a side-by-side evaluation on the same terrain.
+
+## Real-robot results
+Tested on a real Unitree G1 (policy run by the C++ `g1_ctrl` controller on the onboard Jetson Orin, with a safety hoist):
+- Forward and backward walking
+- Turning left and right (the flat base policy did not turn on the real robot)
+- Lateral walking
+- Disturbance rejection
+
+Known limitations:
+- The heading drifts slowly when walking straight.
+- The robot keeps stepping in place under a zero velocity command.
 
 ## Play, export and deploy
 ```bash
@@ -74,6 +91,7 @@ deploy/robots/g1_29dof/config/policy/velocity/v2/
 └── params/deploy.yaml        # included
 ```
 Then build and run the upstream controller (`deploy/robots/g1_29dof`) as described in the upstream README: sim2sim in unitree_mujoco first, then sim2real with `./g1_ctrl --network <net-if>`. The controller loads the last version folder under `config/policy/velocity/` that contains `exported/`.
+To drive the robot from the keyboard, rename the `velocity_commands` observation in `deploy.yaml` to `keyboard_velocity_commands` (see the comment at the top of upstream `State_RLBase.cpp`). The `min_delay_steps` / `max_delay_steps` entries in `deploy.yaml` are training-only and ignored by the controller.
 
 Checkpoints and ONNX files are not included.
 
